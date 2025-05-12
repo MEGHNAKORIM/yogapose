@@ -6,9 +6,14 @@ import csv
 import os
 
 
-# Create a pose instance
+# Create a pose instance with improved detection parameters
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose()
+pose = mp_pose.Pose(
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7,
+    smooth_landmarks=True,
+    static_image_mode=False
+)
 
 # Function to calculate angle between three points
 def calculate_angle(landmark1, landmark2, landmark3,select=''):
@@ -26,7 +31,18 @@ def calculate_angle(landmark1, landmark2, landmark3,select=''):
     #angle_calc = 360-angle_calc if angle_calc > 215 else angle_calc
     return angle_calc
 
-def correct_feedback(model,video='0',input_csv='0'):
+# Initialize smoothing for angles
+def smooth_angles(new_angle, prev_angle, alpha=0.8):
+    if prev_angle is None:
+        return new_angle
+    return alpha * prev_angle + (1 - alpha) * new_angle
+
+def correct_feedback(model, video=0, input_csv='0'):
+    # Initialize previous angles for smoothing
+    prev_angles = [None] * 12
+    # Initialize pose classification counter
+    pose_counter = 0
+    last_pose = None
     # Load video
     cap = cv2.VideoCapture(video)  # Replace with your video path
 
@@ -138,19 +154,27 @@ def correct_feedback(model,video='0',input_csv='0'):
             
             Name_Yoga_Classification = str(y[0])
 
-            # Dự đoán xác suất cho mỗi lớp
+            # Get prediction probabilities for each class
             probabilities = model.predict_proba([angles])
-            print([probabilities])
-            # Lấy danh sách các lớp
             class_labels = model.classes_
-            check_accry_class = False
-            # Kiểm tra xác suất của từng lớp
-            for i,class_label in enumerate(class_labels):
-                probability = probabilities[0, i]
-                if probability > 0.5 :
-                    check_accry_class = True
+            max_prob_idx = np.argmax(probabilities[0])
+            max_prob = probabilities[0][max_prob_idx]
+            predicted_pose = str(class_labels[max_prob_idx])
+            
+            # Implement pose stability check
+            if max_prob > 0.7:  # Only accept high confidence predictions
+                if predicted_pose == last_pose:
+                    pose_counter += 1
                 else:
-                    continue
+                    pose_counter = 0
+                last_pose = predicted_pose
+                
+                # Only update pose classification after stable detection
+                if pose_counter > 5:  # Need 5 consistent frames
+                    Name_Yoga_Classification = predicted_pose
+                    check_accry_class = True
+            else:
+                check_accry_class = False
 
             with open(input_csv, 'r') as inputCSV:
                 for row in csv.reader(inputCSV):
@@ -196,19 +220,34 @@ def correct_feedback(model,video='0',input_csv='0'):
                 point_c = (int(landmarks[angle_coordinates[itr][2]].x * image.shape[1]),
                         int(landmarks[angle_coordinates[itr][2]].y * image.shape[0]))
 
-                angle_obtained = calculate_angle(point_a, point_b, point_c,'0')
-                    
-                if angle_obtained < accurate_angle_lists[itr] - correction_value:
-                    status = "more"
-                elif accurate_angle_lists[itr] + correction_value < angle_obtained:
-                    status = "less"
+                # Calculate and smooth the angle
+                raw_angle = calculate_angle(point_a, point_b, point_c, '0')
+                angle_obtained = smooth_angles(raw_angle, prev_angles[itr])
+                prev_angles[itr] = angle_obtained
+
+                # Dynamic correction value based on the joint
+                joint_correction = correction_value
+                if 'shoulder' in angle_name_list[itr].lower() or 'hip' in angle_name_list[itr].lower():
+                    joint_correction = correction_value * 1.2  # More tolerance for larger joints
+                elif 'wrist' in angle_name_list[itr].lower() or 'ankle' in angle_name_list[itr].lower():
+                    joint_correction = correction_value * 0.8  # Less tolerance for smaller joints
+
+                # Calculate percentage of correctness
+                target_angle = accurate_angle_lists[itr]
+                diff_percentage = abs(angle_obtained - target_angle) / target_angle * 100
+
+                if angle_obtained < target_angle - joint_correction:
+                    status = f"Increase {angle_name_list[itr]} ({diff_percentage:.0f}% low)"
+                elif angle_obtained > target_angle + joint_correction:
+                    status = f"Decrease {angle_name_list[itr]} ({diff_percentage:.0f}% high)"
                 else:
-                    status = "OK"
+                    status = "Perfect!"
                     correct_angle_count += 1
 
-                # Display status
-                status_position = (point_b[0] - int(image.shape[1] * 0.03), point_b[1] + int(image.shape[0] * 0.03))
-                cv2.putText(image, f"{status}", status_position, cv2.FONT_HERSHEY_PLAIN, 1.5, (0, 255, 0), 2)
+                # Display status with color-coded feedback
+                status_position = (point_b[0] - int(image.shape[1] * 0.15), point_b[1] + int(image.shape[0] * 0.03))
+                status_color = (0, 255, 0) if status == "Perfect!" else (0, 165, 255)  # Green for perfect, orange for adjustment needed
+                cv2.putText(image, f"{status}", status_position, cv2.FONT_HERSHEY_PLAIN, 1.2, status_color, 2)
 
 
                 # Display angle values on the image
@@ -222,24 +261,68 @@ def correct_feedback(model,video='0',input_csv='0'):
                 
 
 
-            # # Draw the entire pose on the person
+            # Enhanced pose visualization
             mp_drawing = mp.solutions.drawing_utils
-            mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            # Custom drawing specs for better visibility
+            custom_connections = mp_pose.POSE_CONNECTIONS
+            landmark_drawing_spec = mp_drawing.DrawingSpec(
+                color=(0, 255, 0),  # Green color for landmarks
+                thickness=3,
+                circle_radius=3
+            )
+            connection_drawing_spec = mp_drawing.DrawingSpec(
+                color=(255, 255, 255),  # White color for connections
+                thickness=2
+            )
+            # Draw the pose landmarks and connections
+            mp_drawing.draw_landmarks(
+                image,
+                results.pose_landmarks,
+                custom_connections,
+                landmark_drawing_spec,
+                connection_drawing_spec
+            )
             
+            # Enhanced posture feedback with detailed guidance
+            if correct_angle_count > 9:
+                posture = "EXCELLENT FORM!"
+                feedback = "Hold this position and breathe deeply"
+                secondary_feedback = f"Maintaining {Name_Yoga_Classification} pose perfectly"
+            elif correct_angle_count > 6:
+                posture = "ALMOST THERE!"
+                feedback = "Small adjustments needed"
+                secondary_feedback = "Focus on the highlighted joints"
+            else:
+                posture = "ADJUSTING"
+                feedback = "Follow the angle guides carefully"
+                secondary_feedback = "Take your time to align properly"
             
-            posture = "CORRECT" if correct_angle_count > 9 else "WRONG"
-            posture_color = (0, 255, 0) if posture == "CORRECT" else (0, 0, 255)  # Màu xanh cho đúng, màu đỏ cho sai
+            # Color coding for different states
+            posture_color = {
+                "EXCELLENT FORM!": (0, 255, 0),    # Green
+                "ALMOST THERE!": (0, 165, 255),   # Orange
+                "ADJUSTING": (0, 0, 255)          # Red
+            }[posture]
 
-            # Thiết lập văn bản và màu cho tư thế
-            posture_position = (10, 30)  # Điều chỉnh giá trị này để đặt văn bản
-            cv2.putText(image, f"Yoga movements: {posture}", posture_position, cv2.FONT_HERSHEY_PLAIN, 1.5, posture_color, 2)
+            # Create a semi-transparent overlay for status display
+            overlay = image.copy()
+            # Draw background rectangle for better text visibility
+            cv2.rectangle(overlay, (0, 0), (image.shape[1], 100), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.3, image, 0.7, 0, image)
+            
+            # Display enhanced feedback
+            cv2.putText(image, f"Status: {posture}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, posture_color, 2)
+            cv2.putText(image, f"Guidance: {feedback}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(image, secondary_feedback, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+            
+            # Display confidence percentage when pose is detected
+            if check_accry_class:
+                confidence_text = f"Confidence: {max_prob*100:.1f}%"
+                cv2.putText(image, confidence_text, (image.shape[1]-200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Thiết lập màu văn bản và định dạng cho FPS
-            fps_text = f"FPS: {1.0 / (time.time() - fps_time):.3f}"  # Hiển thị FPS với 3 chữ số sau dấu thập phân
-            fps_position = (10, 60)  # Điều chỉnh giá trị này để đặt văn bản
-            cv2.putText(image, fps_text, fps_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-            # # Xác định chiều dài nhỏ nhất của hai ảnh
+            # Display FPS
+            fps_text = f"FPS: {1.0 / (time.time() - fps_time):.1f}"
+            cv2.putText(image, fps_text, (10, 120), cv2.FONT_HERSHEY_PLAIN, 1.2, (255, 255, 255), 1)
             # min_height = min(ins_resize.shape[0], resize_rgb.shape[0])
 
             # # Thay đổi kích thước ảnh để chiều dài bằng nhau
